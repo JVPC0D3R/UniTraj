@@ -106,18 +106,36 @@ class BaseDataset(Dataset):
         self.data_loaded_keys = list(self.data_loaded.keys())
         print('Data loaded')
 
+    def modify_mapping(self, mapping, name_mod):
+
+        new_mapping = {}
+
+        for k, v in list(mapping.items()):
+            base, ext = os.path.splitext(k)
+            new_k = f"{base}{name_mod}{ext}"
+            new_mapping[new_k] = v
+
+        return new_mapping
+            
     def process_data_chunk(self, worker_index):
         with open(os.path.join('tmp', '{}.pkl'.format(worker_index)), 'rb') as f:
             data_chunk = pickle.load(f)
         file_list = {}
         data_path, mapping, data_list, dataset_name = data_chunk
-        hdf5_path = os.path.join(self.cache_path, f'{worker_index}.h5')
+        mod_name = self.config['mod_name']
+        hdf5_path = os.path.join(self.cache_path, f'{worker_index}{mod_name}.h5')
 
         with h5py.File(hdf5_path, 'w') as f:
             for cnt, file_name in enumerate(data_list):
                 if worker_index == 0 and cnt % max(int(len(data_list) / 10), 1) == 0:
                     print(f'{cnt}/{len(data_list)} data processed', flush=True)
-                scenario = read_scenario(data_path, mapping, file_name)
+
+                base, ext = os.path.splitext(file_name)
+                mod_file_name = f"{base}{mod_name}{ext}"
+
+                mod_mapping = self.modify_mapping(mapping, mod_name)
+
+                scenario = read_scenario(data_path, mod_mapping, mod_file_name)
 
                 try:
                     output = self.preprocess(scenario)
@@ -127,7 +145,7 @@ class BaseDataset(Dataset):
                     output = self.postprocess(output)
 
                 except Exception as e:
-                    print('Warning: {} in {}'.format(e, file_name))
+                    print('Warning: {} in {}'.format(e, mod_file_name))
                     output = None
 
                 if output is None: continue
@@ -176,8 +194,10 @@ class BaseDataset(Dataset):
                 if len(value.shape) == 1:
                     state[key] = np.expand_dims(value, axis=-1)
             all_state = [state['position'], state['length'], state['width'], state['height'], state['heading'],
-                         state['velocity'], state['valid']]
-            # type, x,y,z,l,w,h,heading,vx,vy,valid
+                         state['velocity'], state['valid'],
+                         state[self.config['attr_1']].reshape(state[self.config['attr_1']].shape[0], -1),
+                         state[self.config['attr_2']]]
+            # type, x,y,z,l,w,h,heading,vx,vy,valid + attr_1,attr_2 | (total_steps, 10) -> (total_steps, 62)
             all_state = np.concatenate(all_state, axis=-1)
             # all_state = all_state[::sample_inverval]
             if all_state.shape[0] < ending_fame:
