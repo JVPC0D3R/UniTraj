@@ -609,7 +609,7 @@ class BaseDataset(Dataset):
             center_heading=center_objects[:, 6],
             heading_index=6, rot_vel_index=[7, 8]
         )
-        obj_trajs_future_state = obj_trajs_future[:, :, :, np.r_[0, 1, 7, 8, 9:60]]  # (x, y, vx, vy, keypoints)
+        obj_trajs_future_state = obj_trajs_future[:, :, :, np.r_[0, 1, 7, 8, 10:61]]  # (x, y, vx, vy, keypoints)
         obj_trajs_future_mask = obj_trajs_future[:, :, :, 9] # -1 -> 9 (valid is in position 9)
         obj_trajs_future_state[obj_trajs_future_mask == 0] = 0
 
@@ -628,8 +628,8 @@ class BaseDataset(Dataset):
 
         obj_trajs_pos = obj_trajs_data[:, :, :, 0:3]
 
-        obj_trajs_keypoints = obj_trajs_data[:, :, :, 9:60] # Add keypoints
-        obj_trajs_last_keypoints = obj_trajs_data[:, :, 10, 9:60] # time step 10
+        obj_trajs_keypoints = obj_trajs_data[:, :, :, 10:61] # Add keypoints
+        obj_trajs_last_keypoints = obj_trajs_data[:, :, 10, 10:61] # time step 10
         obj_trajs_mask_keypoints = obj_trajs[:, :, :, 61] # keypoint mask
 
         num_center_objects, num_objects, num_timestamps, _ = obj_trajs_pos.shape
@@ -734,7 +734,7 @@ class BaseDataset(Dataset):
 
         # attr_1
         keypoints = []
-        kp_array = obj_trajs[:,:,:,9:60].reshape(num_center_objects,num_objects,num_timestamps,17,3)
+        kp_array = obj_trajs[:,:,:,10:61].reshape(num_center_objects,num_objects,num_timestamps,17,3)
 
         for kp in range(17):
             keypoint = kp_array[:,:,:,kp,:] - center_xyz[:, None, None, :]
@@ -745,7 +745,7 @@ class BaseDataset(Dataset):
                 ).reshape(num_center_objects, num_objects, num_timestamps, 3)
             keypoints.append(keypoint)
 
-        obj_trajs[:,:,:,9:60] = np.stack(keypoints, axis=3).reshape(num_center_objects,num_objects,num_timestamps,-1)
+        obj_trajs[:,:,:,10:61] = np.stack(keypoints, axis=3).reshape(num_center_objects,num_objects,num_timestamps,-1)
 
         return obj_trajs
 
