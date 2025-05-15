@@ -350,11 +350,20 @@ class BaseDataset(Dataset):
         else:
             sample_list = list(ret['tracks_to_predict'].keys())  # + ret.get('objects_of_interest', [])
             sample_list = list(set(sample_list))
+
+            valid_ids = []
+            all_candidates = list(zip(track_infos['object_id'], track_infos['object_type']))
+                
+            type_buckets = {1: [], 2: [], 3: []}
+            for idx, (oid, otype) in enumerate(all_candidates):
+                if len(valid_ids) < 8 and otype in type_buckets and track_infos['trajs'][idx, 10, 9]:
+                    if len(type_buckets[otype]) < 4:
+                        type_buckets[otype].append((oid, idx))
+                        valid_ids.append(oid)
+            
             tracks_to_predict = {
-                'track_index': [track_infos['object_id'].index(id) for id in sample_list if
-                                id in track_infos['object_id']],
-                'object_type': [track_infos['object_type'][track_infos['object_id'].index(id)] for id in sample_list if
-                                id in track_infos['object_id']],
+                'track_index': [track_infos['object_id'].index(id) for id in valid_ids],
+                'object_type': [track_infos['object_type'][track_infos['object_id'].index(id)] for id in valid_ids],
             }
 
         ret['tracks_to_predict'] = tracks_to_predict
@@ -377,7 +386,7 @@ class BaseDataset(Dataset):
 
         track_index_to_predict = np.array(info['tracks_to_predict']['track_index'])
         obj_types = np.array(track_infos['object_type'])
-        obj_trajs_full = track_infos['trajs']  # (num_objects, num_timestamp, 10)
+        obj_trajs_full = track_infos['trajs']  # (num_objects, num_timestamp, 10) -> (num_objects, num_timestamp, 62)
         obj_trajs_past = obj_trajs_full[:, :current_time_index + 1]
         obj_trajs_future = obj_trajs_full[:, current_time_index + 1:]
 
@@ -394,7 +403,8 @@ class BaseDataset(Dataset):
         (obj_trajs_data, obj_trajs_mask, obj_trajs_pos, obj_trajs_last_pos, obj_trajs_future_state,
          obj_trajs_future_mask, center_gt_trajs,
          center_gt_trajs_mask, center_gt_final_valid_idx,
-         track_index_to_predict_new) = self.get_agent_data(
+         track_index_to_predict_new, obj_trajs_keypoints,
+         obj_trajs_last_keypoints, obj_trajs_mask_keypoints) = self.get_agent_data(
             center_objects=center_objects, obj_trajs_past=obj_trajs_past, obj_trajs_future=obj_trajs_future,
             track_index_to_predict=track_index_to_predict, sdc_track_index=sdc_track_index,
             timestamps=timestamps, obj_types=obj_types
@@ -407,6 +417,9 @@ class BaseDataset(Dataset):
             'track_index_to_predict': track_index_to_predict_new,  # used to select center-features
             'obj_trajs_pos': obj_trajs_pos,
             'obj_trajs_last_pos': obj_trajs_last_pos,
+            'obj_trajs_keypoints': obj_trajs_keypoints,
+            'obj_trajs_last_keypoints': obj_trajs_last_keypoints,
+            'obj_trajs_mask_keypoints': obj_trajs_mask_keypoints,
 
             'center_objects_world': center_objects,
             'center_objects_id': np.array(track_infos['object_id'])[track_index_to_predict],
@@ -586,7 +599,7 @@ class BaseDataset(Dataset):
             acce,
         ], axis=-1)
 
-        obj_trajs_mask = obj_trajs[:, :, :, -1]
+        obj_trajs_mask = obj_trajs[:, :, :, 9] # -1 -> 9 (valid is in position 9)
         obj_trajs_data[obj_trajs_mask == 0] = 0
 
         obj_trajs_future = obj_trajs_future.astype(np.float32)
@@ -596,8 +609,8 @@ class BaseDataset(Dataset):
             center_heading=center_objects[:, 6],
             heading_index=6, rot_vel_index=[7, 8]
         )
-        obj_trajs_future_state = obj_trajs_future[:, :, :, [0, 1, 7, 8]]  # (x, y, vx, vy)
-        obj_trajs_future_mask = obj_trajs_future[:, :, :, -1]
+        obj_trajs_future_state = obj_trajs_future[:, :, :, np.r_[0, 1, 7, 8, 9:60]]  # (x, y, vx, vy, keypoints)
+        obj_trajs_future_mask = obj_trajs_future[:, :, :, 9] # -1 -> 9 (valid is in position 9)
         obj_trajs_future_state[obj_trajs_future_mask == 0] = 0
 
         center_obj_idxs = np.arange(len(track_index_to_predict))
@@ -606,7 +619,7 @@ class BaseDataset(Dataset):
         center_gt_trajs[center_gt_trajs_mask == 0] = 0
 
         assert obj_trajs_past.__len__() == obj_trajs_data.shape[1]
-        valid_past_mask = np.logical_not(obj_trajs_past[:, :, -1].sum(axis=-1) == 0)
+        valid_past_mask = np.logical_not(obj_trajs_past[:, :, 9].sum(axis=-1) == 0) # -1 -> 9 (valid is in position 9)
 
         obj_trajs_mask = obj_trajs_mask[:, valid_past_mask]
         obj_trajs_data = obj_trajs_data[:, valid_past_mask]
@@ -614,6 +627,11 @@ class BaseDataset(Dataset):
         obj_trajs_future_mask = obj_trajs_future_mask[:, valid_past_mask]
 
         obj_trajs_pos = obj_trajs_data[:, :, :, 0:3]
+
+        obj_trajs_keypoints = obj_trajs_data[:, :, :, 9:60] # Add keypoints
+        obj_trajs_last_keypoints = obj_trajs_data[:, :, 10, 9:60] # time step 10
+        obj_trajs_mask_keypoints = obj_trajs[:, :, :, 61] # keypoint mask
+
         num_center_objects, num_objects, num_timestamps, _ = obj_trajs_pos.shape
         obj_trajs_last_pos = np.zeros((num_center_objects, num_objects, 3), dtype=np.float32)
         for k in range(num_timestamps):
@@ -655,7 +673,10 @@ class BaseDataset(Dataset):
         return (obj_trajs_data, obj_trajs_mask.astype(bool), obj_trajs_pos, obj_trajs_last_pos,
                 obj_trajs_future_state, obj_trajs_future_mask, center_gt_trajs, center_gt_trajs_mask,
                 center_gt_final_valid_idx,
-                track_index_to_predict_new)
+                track_index_to_predict_new,
+                obj_trajs_keypoints,
+                obj_trajs_last_keypoints,
+                obj_trajs_mask_keypoints)
 
     def get_interested_agents(self, track_index_to_predict, obj_trajs_full, current_time_index, obj_types, scene_id):
         center_objects_list = []
@@ -664,8 +685,7 @@ class BaseDataset(Dataset):
         selected_type = [object_type[x] for x in selected_type]
         for k in range(len(track_index_to_predict)):
             obj_idx = track_index_to_predict[k]
-
-            if obj_trajs_full[obj_idx, current_time_index, -1] == 0:
+            if obj_trajs_full[obj_idx, current_time_index, 9] == 0: # Ensure valid mask is accessed
                 print(f'Warning: obj_idx={obj_idx} is not valid at time step {current_time_index}, scene_id={scene_id}')
                 continue
             if obj_types[obj_idx] not in selected_type:
@@ -684,7 +704,7 @@ class BaseDataset(Dataset):
                                          rot_vel_index=None):
         """
         Args:
-            obj_trajs (num_objects, num_timestamps, num_attrs):
+            obj_trajs (num_objects, num_timestamps, num_attrs): 10 -> 62
                 first three values of num_attrs are [x, y, z] or [x, y]
             center_xyz (num_center_objects, 3 or 2): [x, y, z] or [x, y]
             center_heading (num_center_objects):
@@ -711,6 +731,21 @@ class BaseDataset(Dataset):
                 points=obj_trajs[:, :, :, rot_vel_index].reshape(num_center_objects, -1, 2),
                 angle=-center_heading
             ).reshape(num_center_objects, num_objects, num_timestamps, 2)
+
+        # attr_1
+        keypoints = []
+        kp_array = obj_trajs[:,:,:,9:60].reshape(num_center_objects,num_objects,num_timestamps,17,3)
+
+        for kp in range(17):
+            keypoint = kp_array[:,:,:,kp,:] - center_xyz[:, None, None, :]
+
+            keypoint = common_utils.rotate_points_along_z(
+                points=keypoint.reshape(num_center_objects, -1, 3),
+                angle=-center_heading
+                ).reshape(num_center_objects, num_objects, num_timestamps, 3)
+            keypoints.append(keypoint)
+
+        obj_trajs[:,:,:,9:60] = np.stack(keypoints, axis=3).reshape(num_center_objects,num_objects,num_timestamps,-1)
 
         return obj_trajs
 
