@@ -403,8 +403,7 @@ class BaseDataset(Dataset):
         (obj_trajs_data, obj_trajs_mask, obj_trajs_pos, obj_trajs_last_pos, obj_trajs_future_state,
          obj_trajs_future_mask, center_gt_trajs,
          center_gt_trajs_mask, center_gt_final_valid_idx,
-         track_index_to_predict_new, obj_trajs_keypoints,
-         obj_trajs_last_keypoints, obj_trajs_mask_keypoints) = self.get_agent_data(
+         track_index_to_predict_new, obj_trajs_future_kp_mask) = self.get_agent_data(
             center_objects=center_objects, obj_trajs_past=obj_trajs_past, obj_trajs_future=obj_trajs_future,
             track_index_to_predict=track_index_to_predict, sdc_track_index=sdc_track_index,
             timestamps=timestamps, obj_types=obj_types
@@ -417,9 +416,6 @@ class BaseDataset(Dataset):
             'track_index_to_predict': track_index_to_predict_new,  # used to select center-features
             'obj_trajs_pos': obj_trajs_pos,
             'obj_trajs_last_pos': obj_trajs_last_pos,
-            'obj_trajs_keypoints': obj_trajs_keypoints,
-            'obj_trajs_last_keypoints': obj_trajs_last_keypoints,
-            'obj_trajs_mask_keypoints': obj_trajs_mask_keypoints,
 
             'center_objects_world': center_objects,
             'center_objects_id': np.array(track_infos['object_id'])[track_index_to_predict],
@@ -428,6 +424,7 @@ class BaseDataset(Dataset):
 
             'obj_trajs_future_state': obj_trajs_future_state,
             'obj_trajs_future_mask': obj_trajs_future_mask,
+            'obj_trajs_future_kp_mask': obj_trajs_future_kp_mask,
             'center_gt_trajs': center_gt_trajs,
             'center_gt_trajs_mask': center_gt_trajs_mask,
             'center_gt_final_valid_idx': center_gt_final_valid_idx,
@@ -566,7 +563,8 @@ class BaseDataset(Dataset):
             obj_trajs=obj_trajs_past,
             center_xyz=center_objects[:, 0:3],
             center_heading=center_objects[:, 6],
-            heading_index=6, rot_vel_index=[7, 8]
+            heading_index=6, rot_vel_index=[7, 8],
+            skip=True
         )
 
         object_onehot_mask = np.zeros((num_center_objects, num_objects, num_timestamps, 5))
@@ -597,6 +595,7 @@ class BaseDataset(Dataset):
             object_heading_embedding,
             obj_trajs[:, :, :, 7:9],
             acce,
+            obj_trajs[:, :, :, 10:] # keypoints + kp mask
         ], axis=-1)
 
         obj_trajs_mask = obj_trajs[:, :, :, 9] # -1 -> 9 (valid is in position 9)
@@ -607,11 +606,13 @@ class BaseDataset(Dataset):
             obj_trajs=obj_trajs_future,
             center_xyz=center_objects[:, 0:3],
             center_heading=center_objects[:, 6],
-            heading_index=6, rot_vel_index=[7, 8]
+            heading_index=6, rot_vel_index=[7, 8],
+            skip=True
         )
         obj_trajs_future_state = obj_trajs_future[:, :, :, np.r_[0, 1, 7, 8, 10:61]]  # (x, y, vx, vy, keypoints)
         obj_trajs_future_mask = obj_trajs_future[:, :, :, 9] # -1 -> 9 (valid is in position 9)
         obj_trajs_future_state[obj_trajs_future_mask == 0] = 0
+        obj_trajs_future_kp_mask = obj_trajs_future[:, :, :, 61] # get keypoint mask
 
         center_obj_idxs = np.arange(len(track_index_to_predict))
         center_gt_trajs = obj_trajs_future_state[center_obj_idxs, track_index_to_predict]
@@ -627,11 +628,6 @@ class BaseDataset(Dataset):
         obj_trajs_future_mask = obj_trajs_future_mask[:, valid_past_mask]
 
         obj_trajs_pos = obj_trajs_data[:, :, :, 0:3]
-
-        obj_trajs_keypoints = obj_trajs_data[:, :, :, 10:61] # Add keypoints
-        obj_trajs_last_keypoints = obj_trajs_data[:, :, 10, 10:61] # time step 10
-        obj_trajs_mask_keypoints = obj_trajs[:, :, :, 61] # keypoint mask
-
         num_center_objects, num_objects, num_timestamps, _ = obj_trajs_pos.shape
         obj_trajs_last_pos = np.zeros((num_center_objects, num_objects, 3), dtype=np.float32)
         for k in range(num_timestamps):
@@ -672,11 +668,7 @@ class BaseDataset(Dataset):
 
         return (obj_trajs_data, obj_trajs_mask.astype(bool), obj_trajs_pos, obj_trajs_last_pos,
                 obj_trajs_future_state, obj_trajs_future_mask, center_gt_trajs, center_gt_trajs_mask,
-                center_gt_final_valid_idx,
-                track_index_to_predict_new,
-                obj_trajs_keypoints,
-                obj_trajs_last_keypoints,
-                obj_trajs_mask_keypoints)
+                center_gt_final_valid_idx, track_index_to_predict_new, obj_trajs_future_kp_mask)
 
     def get_interested_agents(self, track_index_to_predict, obj_trajs_full, current_time_index, obj_types, scene_id):
         center_objects_list = []
@@ -701,7 +693,7 @@ class BaseDataset(Dataset):
         return center_objects, track_index_to_predict
 
     def transform_trajs_to_center_coords(self, obj_trajs, center_xyz, center_heading, heading_index,
-                                         rot_vel_index=None):
+                                         rot_vel_index=None, skip =False):
         """
         Args:
             obj_trajs (num_objects, num_timestamps, num_attrs): 10 -> 62
@@ -716,36 +708,40 @@ class BaseDataset(Dataset):
         assert center_xyz.shape[1] in [3, 2]
 
         obj_trajs = np.tile(obj_trajs[None, :, :, :], (num_center_objects, 1, 1, 1))
-        obj_trajs[:, :, :, 0:center_xyz.shape[1]] -= center_xyz[:, None, None, :]
-        obj_trajs[:, :, :, 0:2] = common_utils.rotate_points_along_z(
-            points=obj_trajs[:, :, :, 0:2].reshape(num_center_objects, -1, 2),
-            angle=-center_heading
-        ).reshape(num_center_objects, num_objects, num_timestamps, 2)
 
-        obj_trajs[:, :, :, heading_index] -= center_heading[:, None, None]
+        if not skip:
+            obj_trajs[:, :, :, 0:center_xyz.shape[1]] -= center_xyz[:, None, None, :]
+            obj_trajs[:, :, :, 0:2] = common_utils.rotate_points_along_z(
+                points=obj_trajs[:, :, :, 0:2].reshape(num_center_objects, -1, 2),
+                angle=-center_heading
+            ).reshape(num_center_objects, num_objects, num_timestamps, 2)
+
+            obj_trajs[:, :, :, heading_index] -= center_heading[:, None, None]
 
         # rotate direction of velocity
-        if rot_vel_index is not None:
+        if rot_vel_index is not None and not skip:
             assert len(rot_vel_index) == 2
             obj_trajs[:, :, :, rot_vel_index] = common_utils.rotate_points_along_z(
                 points=obj_trajs[:, :, :, rot_vel_index].reshape(num_center_objects, -1, 2),
                 angle=-center_heading
             ).reshape(num_center_objects, num_objects, num_timestamps, 2)
 
-        # attr_1
+        # kps stored between 10 and 51
         keypoints = []
-        kp_array = obj_trajs[:,:,:,10:61].reshape(num_center_objects,num_objects,num_timestamps,17,3)
 
-        for kp in range(17):
-            keypoint = kp_array[:,:,:,kp,:] - center_xyz[:, None, None, :]
+        if not skip:
+            kp_array = obj_trajs[:,:,:,10:61].reshape(num_center_objects,num_objects,num_timestamps,17,3)
 
-            keypoint = common_utils.rotate_points_along_z(
-                points=keypoint.reshape(num_center_objects, -1, 3),
-                angle=-center_heading
-                ).reshape(num_center_objects, num_objects, num_timestamps, 3)
-            keypoints.append(keypoint)
+            for kp in range(17):
+                keypoint = kp_array[:,:,:,kp,:] - center_xyz[:, None, None, :]
 
-        obj_trajs[:,:,:,10:61] = np.stack(keypoints, axis=3).reshape(num_center_objects,num_objects,num_timestamps,-1)
+                keypoint = common_utils.rotate_points_along_z(
+                    points=keypoint.reshape(num_center_objects, -1, 3),
+                    angle=-center_heading
+                    ).reshape(num_center_objects, num_objects, num_timestamps, 3)
+                keypoints.append(keypoint)
+
+            obj_trajs[:,:,:,10:61] = np.stack(keypoints, axis=3).reshape(num_center_objects,num_objects,num_timestamps,-1)
 
         return obj_trajs
 
