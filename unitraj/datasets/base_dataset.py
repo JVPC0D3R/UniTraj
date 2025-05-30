@@ -440,8 +440,7 @@ class BaseDataset(Dataset):
                 center_objects=center_objects, map_infos=info['map_infos'])
         else:
             map_polylines_data, map_polylines_mask, map_polylines_center = self.get_map_data(
-                center_objects=center_objects, map_infos=info['map_infos'])
-
+                center_objects=center_objects, map_infos=info['map_infos'], skip =True)
         ret_dict['map_polylines'] = map_polylines_data
         ret_dict['map_polylines_mask'] = map_polylines_mask.astype(bool)
         ret_dict['map_polylines_center'] = map_polylines_center
@@ -745,7 +744,7 @@ class BaseDataset(Dataset):
 
         return obj_trajs
 
-    def get_map_data(self, center_objects, map_infos):
+    def get_map_data(self, center_objects, map_infos, skip = True):
 
         num_center_objects = center_objects.shape[0]
 
@@ -763,7 +762,7 @@ class BaseDataset(Dataset):
             return neighboring_polylines
 
         polylines = np.expand_dims(map_infos['all_polylines'].copy(), axis=0).repeat(num_center_objects, axis=0)
-
+        global_map_polylines = polylines.copy()
         map_polylines = transform_to_center_coordinates(neighboring_polylines=polylines)
         num_of_src_polylines = self.config['max_num_roads']
         map_infos['polyline_transformed'] = map_polylines
@@ -776,6 +775,8 @@ class BaseDataset(Dataset):
         num_agents = all_polylines.shape[0]
         polyline_list = []
         polyline_mask_list = []
+        global_polyline_list = []
+        all_global_polylines = global_map_polylines.copy()
 
         for k, v in map_infos.items():
             if k == 'all_polylines' or k not in line_type:
@@ -785,6 +786,7 @@ class BaseDataset(Dataset):
             for polyline_dict in v:
                 polyline_index = polyline_dict.get('polyline_index', None)
                 polyline_segment = all_polylines[:, polyline_index[0]:polyline_index[1]]
+                global_polyline_segment = all_global_polylines[:, polyline_index[0]:polyline_index[1]]
                 polyline_segment_x = polyline_segment[:, :, 0] - center_offset[0]
                 polyline_segment_y = polyline_segment[:, :, 1] - center_offset[1]
                 in_range_mask = (abs(polyline_segment_x) < map_range) * (abs(polyline_segment_y) < map_range)
@@ -796,29 +798,39 @@ class BaseDataset(Dataset):
 
                 segment_list = np.zeros([num_agents, max_segments, max_points_per_lane, 7], dtype=np.float32)
                 segment_mask_list = np.zeros([num_agents, max_segments, max_points_per_lane], dtype=np.int32)
+                global_segment_list = np.zeros([num_agents, max_segments, max_points_per_lane, 7], dtype=np.float32)
 
                 for i in range(polyline_segment.shape[0]):
                     if in_range_mask[i].sum() == 0:
                         continue
                     segment_i = polyline_segment[i]
                     segment_index = segment_index_list[i]
+                    global_segment_i = global_polyline_segment[i]
+
                     for num, seg_index in enumerate(segment_index):
                         segment = segment_i[seg_index]
+                        global_segment = global_segment_i[seg_index]
                         if segment.shape[0] > max_points_per_lane:
                             segment_list[i, num] = segment[
                                 np.linspace(0, segment.shape[0] - 1, max_points_per_lane, dtype=int)]
+                            global_segment_list[i, num] = global_segment[
+                                np.linspace(0, global_segment.shape[0] - 1, max_points_per_lane, dtype=int)]
                             segment_mask_list[i, num] = 1
                         else:
                             segment_list[i, num, :segment.shape[0]] = segment
+                            global_segment_list[i, num, :global_segment.shape[0]] = global_segment
                             segment_mask_list[i, num, :segment.shape[0]] = 1
 
                 polyline_list.append(segment_list)
                 polyline_mask_list.append(segment_mask_list)
+
+                global_polyline_list.append(global_segment_list)
         if len(polyline_list) == 0: return np.zeros((num_agents, 0, max_points_per_lane, 7)), np.zeros(
             (num_agents, 0, max_points_per_lane))
         batch_polylines = np.concatenate(polyline_list, axis=1)
         batch_polylines_mask = np.concatenate(polyline_mask_list, axis=1)
 
+        global_batch_polylines = np.concatenate(global_polyline_list, axis=1)
         polyline_xy_offsetted = batch_polylines[:, :, :, 0:2] - np.reshape(center_offset, (1, 1, 1, 2))
         polyline_center_dist = np.linalg.norm(polyline_xy_offsetted, axis=-1).sum(-1) / np.clip(
             batch_polylines_mask.sum(axis=-1).astype(float), a_min=1.0, a_max=None)
@@ -828,6 +840,8 @@ class BaseDataset(Dataset):
         # Ensure topk_idxs has the correct shape for indexing
         topk_idxs = np.expand_dims(topk_idxs, axis=-1)
         topk_idxs = np.expand_dims(topk_idxs, axis=-1)
+
+        global_selected = np.take_along_axis(global_batch_polylines, topk_idxs, axis=1)
         map_polylines = np.take_along_axis(batch_polylines, topk_idxs, axis=1)
         map_polylines_mask = np.take_along_axis(batch_polylines_mask, topk_idxs[..., 0], axis=1)
 
@@ -836,6 +850,10 @@ class BaseDataset(Dataset):
                                ((0, 0), (0, num_of_src_polylines - map_polylines.shape[1]), (0, 0), (0, 0)))
         map_polylines_mask = np.pad(map_polylines_mask,
                                     ((0, 0), (0, num_of_src_polylines - map_polylines_mask.shape[1]), (0, 0)))
+
+        
+        global_selected = np.pad(global_selected,
+                                ((0, 0), (0, num_of_src_polylines - global_selected.shape[1]), (0, 0), (0, 0)))
 
         temp_sum = (map_polylines[:, :, :, 0:3] * map_polylines_mask[:, :, :, None].astype(float)).sum(
             axis=-2)  # (num_center_objects, num_polylines, 3)
@@ -854,7 +872,26 @@ class BaseDataset(Dataset):
         map_polylines = np.concatenate((map_polylines, xy_pos_pre, map_types), axis=-1)
         map_polylines[map_polylines_mask == 0] = 0
 
-        return map_polylines, map_polylines_mask, map_polylines_center
+        if not skip:
+            return map_polylines, map_polylines_mask, map_polylines_center
+
+        else:
+            xy_pos_pre = global_selected[:,:,:, 0:3]
+            xy_pos_pre = np.roll(xy_pos_pre, shift=1, axis=-2)
+            xy_pos_pre[:, :, 0, :] = xy_pos_pre[:, :, 1, :]
+
+            map_types = global_selected[:, : ,:, -1]
+            global_selected   = global_selected[:, : ,:, :-1]
+            map_types_oh = np.eye(20)[map_types.astype(int)]
+
+            global_polylines = np.concatenate(
+                (global_selected, xy_pos_pre, map_types_oh),
+                axis=-1
+            )
+
+            global_polylines[map_polylines_mask == 0] = 0
+
+            return global_polylines, map_polylines_mask, map_polylines_center
 
     def get_manually_split_map_data(self, center_objects, map_infos):
         """
