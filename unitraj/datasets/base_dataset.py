@@ -166,6 +166,72 @@ class BaseDataset(Dataset):
                 del output
 
         return file_list
+    
+    def interpolate_keypoints(self, all_state, threshold = 30):
+        # all_state [total_steps, 62]
+
+        total_steps = all_state.shape[0]
+
+        center = np.expand_dims(all_state[:, 0:3], axis=-2) # [total_steps, 1, 3]
+        keypoints = all_state[:, 10:61].reshape(-1, 17, 3) # [total_steps, 17, 3]
+        valid = all_state[:, 9].astype(bool) # [total_steps]
+        
+        matches = np.all(keypoints == center, axis=-1) # [total_steps, 17]
+        valid_kp = ~matches & np.expand_dims(valid, axis=-1) # [total_steps, 17]
+
+        # per-series processing
+        kp_t = keypoints.transpose(1,0,2) 
+        valid_kp_t = valid_kp.T.astype(bool)
+        
+        # prev and next logic
+        t = np.arange(total_steps)
+
+        raw_prev = np.where(valid_kp_t, t, -1)
+        prev_idx = np.maximum.accumulate(raw_prev, axis=1)
+
+        raw_next = np.where(valid_kp_t, t, total_steps - 1)
+        next_idx = np.minimum.accumulate(raw_next[:, ::-1], axis=1)[:, ::-1]
+
+        # Check if valid steps >= 2
+        counts = valid_kp_t.sum(axis=1) #[17]
+        qualify = (counts >= 2)
+
+        # Prepare output copy
+        inter_kp_t = kp_t.copy()
+
+        if qualify.sum() > 0:
+
+            pi = prev_idx[qualify]
+            ni = next_idx[qualify]
+
+            denom = (ni - pi).astype(float)
+            denom[denom == 0] = 1.0
+
+            t_mat = np.broadcast_to(t, (qualify.sum(), total_steps)).astype(float)
+            w = ((t_mat - pi) / denom)[...,None]
+
+            sel = inter_kp_t[qualify]   # [M,T,3]
+
+            pi_exp = pi[...,None]        # [M,T,1]
+            ni_exp = ni[...,None]
+
+            x_p = np.take_along_axis(sel, pi_exp, axis=1)  # [M,T,3]
+            x_n = np.take_along_axis(sel, ni_exp, axis=1)
+
+            x_lin = x_p * (1 - w) + x_n * w # linear blend
+
+            fill = (~valid_kp_t[qualify]) & (pi >= 0) & (ni < total_steps) & ((ni - pi) <= threshold)
+            fill = np.broadcast_to(fill[...,None], x_lin.shape)
+
+            #print(f"Interpolating... {counts.sum()}")
+
+            inter_kp_t[qualify][fill] = x_lin[fill]
+
+        inter_keypoints = inter_kp_t.transpose(1,0,2).reshape(total_steps, 17*3)
+        out = all_state.copy()
+
+        out[:, 9:60] = inter_keypoints
+        return out
 
     def preprocess(self, scenario):
 
@@ -203,6 +269,9 @@ class BaseDataset(Dataset):
             if all_state.shape[0] < ending_fame:
                 all_state = np.pad(all_state, ((ending_fame - all_state.shape[0], 0), (0, 0)))
             all_state = all_state[starting_fame:ending_fame]
+
+            # Interpolate keypoints
+            all_state = self.interpolate_keypoints(all_state)
 
             assert all_state.shape[0] == total_steps, f'Error: {all_state.shape[0]} != {total_steps}'
 
@@ -403,7 +472,7 @@ class BaseDataset(Dataset):
         (obj_trajs_data, obj_trajs_mask, obj_trajs_pos, obj_trajs_last_pos, obj_trajs_future_state,
          obj_trajs_future_mask, center_gt_trajs,
          center_gt_trajs_mask, center_gt_final_valid_idx,
-         track_index_to_predict_new, obj_trajs_future_kp_mask) = self.get_agent_data(
+         track_index_to_predict_new, obj_kp_mask, obj_future_kp_mask) = self.get_agent_data(
             center_objects=center_objects, obj_trajs_past=obj_trajs_past, obj_trajs_future=obj_trajs_future,
             track_index_to_predict=track_index_to_predict, sdc_track_index=sdc_track_index,
             timestamps=timestamps, obj_types=obj_types
@@ -416,6 +485,7 @@ class BaseDataset(Dataset):
             'track_index_to_predict': track_index_to_predict_new,  # used to select center-features
             'obj_trajs_pos': obj_trajs_pos,
             'obj_trajs_last_pos': obj_trajs_last_pos,
+            'obj_kp_mask': obj_kp_mask,
 
             'center_objects_world': center_objects,
             'center_objects_id': np.array(track_infos['object_id'])[track_index_to_predict],
@@ -424,7 +494,7 @@ class BaseDataset(Dataset):
 
             'obj_trajs_future_state': obj_trajs_future_state,
             'obj_trajs_future_mask': obj_trajs_future_mask,
-            'obj_trajs_future_kp_mask': obj_trajs_future_kp_mask,
+            'obj_trajs_kp_mask': obj_future_kp_mask,
             'center_gt_trajs': center_gt_trajs,
             'center_gt_trajs_mask': center_gt_trajs_mask,
             'center_gt_final_valid_idx': center_gt_final_valid_idx,
@@ -550,6 +620,19 @@ class BaseDataset(Dataset):
         else:
             data_loaded = dict(data_list)
         return data_loaded
+    
+    def update_kp_mask(self, center_bbox, keypoints, valid_mask, kp_mask): 
+        
+        keypoints = keypoints.reshape(*kp_mask.shape, 3)
+
+        center_bbox = np.expand_dims(center_bbox, axis=-2)
+
+        matches = np.all(keypoints == center_bbox, axis=-1)
+        matches = matches & np.expand_dims(valid_mask, axis=-1).astype(bool)
+
+        kp_mask[matches] = 1
+
+        return kp_mask
 
     def get_agent_data(
             self, center_objects, obj_trajs_past, obj_trajs_future, track_index_to_predict, sdc_track_index, timestamps,
@@ -594,11 +677,21 @@ class BaseDataset(Dataset):
             object_heading_embedding,
             obj_trajs[:, :, :, 7:9],
             acce,
-            obj_trajs[:, :, :, 10:] # keypoints + kp mask
+            obj_trajs[:, :, :, 10:] # keypoints + graph mask
         ], axis=-1)
 
         obj_trajs_mask = obj_trajs[:, :, :, 9] # -1 -> 9 (valid is in position 9)
-        obj_trajs_data[obj_trajs_mask == 0] = 0
+        obj_trajs_data[obj_trajs_mask == 0] = 0 # This also invalidate keypoints
+
+        # Keypoint masking past
+        obj_kp_mask = np.zeros((*obj_trajs_mask.shape, 17), dtype=obj_trajs_mask.dtype)
+        obj_kp_mask = self.update_kp_mask(
+            center_bbox = obj_trajs[:, :, :, 0:3],
+            keypoints = obj_trajs[:, :, :, 10:61],
+            valid_mask = obj_trajs_mask,
+            kp_mask = obj_kp_mask
+        )
+
 
         obj_trajs_future = obj_trajs_future.astype(np.float32)
         obj_trajs_future = self.transform_trajs_to_center_coords(
@@ -611,7 +704,15 @@ class BaseDataset(Dataset):
         obj_trajs_future_state = obj_trajs_future[:, :, :, np.r_[0, 1, 7, 8, 10:61]]  # (x, y, vx, vy, keypoints)
         obj_trajs_future_mask = obj_trajs_future[:, :, :, 9] # -1 -> 9 (valid is in position 9)
         obj_trajs_future_state[obj_trajs_future_mask == 0] = 0
-        obj_trajs_future_kp_mask = obj_trajs_future[:, :, :, 61] # get keypoint mask
+        obj_trajs_future_graph_mask = obj_trajs_future[:, :, :, 61] # get graph mask
+
+        obj_future_kp_mask = np.zeros((*obj_trajs_future_mask.shape, 17), dtype=obj_trajs_future_mask.dtype)
+        obj_future_kp_mask = self.update_kp_mask(
+            center_bbox = obj_trajs_future[:, :, :, 0:3],
+            keypoints = obj_trajs_future[:, :, :, 10:61],
+            valid_mask = obj_trajs_future_mask,
+            kp_mask = obj_future_kp_mask
+        )
 
         center_obj_idxs = np.arange(len(track_index_to_predict))
         center_gt_trajs = obj_trajs_future_state[center_obj_idxs, track_index_to_predict]
@@ -667,7 +768,7 @@ class BaseDataset(Dataset):
 
         return (obj_trajs_data, obj_trajs_mask.astype(bool), obj_trajs_pos, obj_trajs_last_pos,
                 obj_trajs_future_state, obj_trajs_future_mask, center_gt_trajs, center_gt_trajs_mask,
-                center_gt_final_valid_idx, track_index_to_predict_new, obj_trajs_future_kp_mask)
+                center_gt_final_valid_idx, track_index_to_predict_new, obj_kp_mask, obj_future_kp_mask)
 
     def get_interested_agents(self, track_index_to_predict, obj_trajs_full, current_time_index, obj_types, scene_id):
         center_objects_list = []
@@ -763,7 +864,10 @@ class BaseDataset(Dataset):
 
         polylines = np.expand_dims(map_infos['all_polylines'].copy(), axis=0).repeat(num_center_objects, axis=0)
         global_map_polylines = polylines.copy()
+            
+        
         map_polylines = transform_to_center_coordinates(neighboring_polylines=polylines)
+        
         num_of_src_polylines = self.config['max_num_roads']
         map_infos['polyline_transformed'] = map_polylines
 
@@ -775,6 +879,7 @@ class BaseDataset(Dataset):
         num_agents = all_polylines.shape[0]
         polyline_list = []
         polyline_mask_list = []
+
         global_polyline_list = []
         all_global_polylines = global_map_polylines.copy()
 
@@ -805,6 +910,7 @@ class BaseDataset(Dataset):
                         continue
                     segment_i = polyline_segment[i]
                     segment_index = segment_index_list[i]
+
                     global_segment_i = global_polyline_segment[i]
 
                     for num, seg_index in enumerate(segment_index):
@@ -831,6 +937,9 @@ class BaseDataset(Dataset):
         batch_polylines_mask = np.concatenate(polyline_mask_list, axis=1)
 
         global_batch_polylines = np.concatenate(global_polyline_list, axis=1)
+
+        #print(global_batch_polylines)
+
         polyline_xy_offsetted = batch_polylines[:, :, :, 0:2] - np.reshape(center_offset, (1, 1, 1, 2))
         polyline_center_dist = np.linalg.norm(polyline_xy_offsetted, axis=-1).sum(-1) / np.clip(
             batch_polylines_mask.sum(axis=-1).astype(float), a_min=1.0, a_max=None)
@@ -873,9 +982,11 @@ class BaseDataset(Dataset):
         map_polylines[map_polylines_mask == 0] = 0
 
         if not skip:
+
             return map_polylines, map_polylines_mask, map_polylines_center
 
         else:
+
             xy_pos_pre = global_selected[:,:,:, 0:3]
             xy_pos_pre = np.roll(xy_pos_pre, shift=1, axis=-2)
             xy_pos_pre[:, :, 0, :] = xy_pos_pre[:, :, 1, :]
@@ -892,6 +1003,7 @@ class BaseDataset(Dataset):
             global_polylines[map_polylines_mask == 0] = 0
 
             return global_polylines, map_polylines_mask, map_polylines_center
+
 
     def get_manually_split_map_data(self, center_objects, map_infos):
         """
