@@ -180,7 +180,7 @@ class BaseDataset(Dataset):
         valid_kp = ~matches & np.expand_dims(valid, axis=-1) # [total_steps, 17]
 
         # per-series processing
-        kp_t = keypoints.transpose(1,0,2) 
+        kp_t = keypoints.transpose(1,0,2)
         valid_kp_t = valid_kp.T.astype(bool)
         
         # prev and next logic
@@ -189,18 +189,19 @@ class BaseDataset(Dataset):
         raw_prev = np.where(valid_kp_t, t, -1)
         prev_idx = np.maximum.accumulate(raw_prev, axis=1)
 
-        raw_next = np.where(valid_kp_t, t, total_steps - 1)
+        # Use sentinel total_steps for next to preserve logic
+        raw_next = np.where(valid_kp_t, t, total_steps)
         next_idx = np.minimum.accumulate(raw_next[:, ::-1], axis=1)[:, ::-1]
+        # Pad with dummy frame to avoid out-of-bounds indexing
+        pad = np.zeros((kp_t.shape[0], 1, 3), dtype=kp_t.dtype)
+        inter_kp_t = np.concatenate([kp_t, pad], axis=1)
+        inter_padded = inter_kp_t.copy()
 
         # Check if valid steps >= 2
         counts = valid_kp_t.sum(axis=1) #[17]
         qualify = (counts >= 2)
 
-        # Prepare output copy
-        inter_kp_t = kp_t.copy()
-
         if qualify.sum() > 0:
-
             pi = prev_idx[qualify]
             ni = next_idx[qualify]
 
@@ -208,29 +209,30 @@ class BaseDataset(Dataset):
             denom[denom == 0] = 1.0
 
             t_mat = np.broadcast_to(t, (qualify.sum(), total_steps)).astype(float)
-            w = ((t_mat - pi) / denom)[...,None]
+            w = ((t_mat - pi) / denom)[..., None]
 
-            sel = inter_kp_t[qualify]   # [M,T,3]
+            sel = inter_padded[qualify]
+            pi_exp = pi[..., None]
+            ni_exp = ni[..., None]
 
-            pi_exp = pi[...,None]        # [M,T,1]
-            ni_exp = ni[...,None]
-
-            x_p = np.take_along_axis(sel, pi_exp, axis=1)  # [M,T,3]
+            x_p = np.take_along_axis(sel, pi_exp, axis=1)
             x_n = np.take_along_axis(sel, ni_exp, axis=1)
 
-            x_lin = x_p * (1 - w) + x_n * w # linear blend
+            x_lin = x_p * (1 - w) + x_n * w
 
             fill = (~valid_kp_t[qualify]) & (pi >= 0) & (ni < total_steps) & ((ni - pi) <= threshold)
-            fill = np.broadcast_to(fill[...,None], x_lin.shape)
+            fill = np.broadcast_to(fill[..., None], x_lin.shape)
 
-            #print(f"Interpolating... {counts.sum()}")
+            # apply only to the first total_steps entries to match fill shape
+            tmp = inter_padded[qualify][:, :total_steps, :]
+            tmp[fill] = x_lin[fill]
+            inter_padded[qualify][:, :total_steps, :] = tmp
 
-            inter_kp_t[qualify][fill] = x_lin[fill]
+        inter_keypoints = inter_padded[:, :total_steps, :]
+        inter_flat = inter_keypoints.transpose(1, 0, 2).reshape(total_steps, 17*3)
 
-        inter_keypoints = inter_kp_t.transpose(1,0,2).reshape(total_steps, 17*3)
         out = all_state.copy()
-
-        out[:, 9:60] = inter_keypoints
+        out[:, 9:60] = inter_flat
         return out
 
     def preprocess(self, scenario):
