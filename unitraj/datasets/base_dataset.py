@@ -496,7 +496,7 @@ class BaseDataset(Dataset):
 
             'obj_trajs_future_state': obj_trajs_future_state,
             'obj_trajs_future_mask': obj_trajs_future_mask,
-            'obj_trajs_kp_mask': obj_future_kp_mask,
+            'obj_future_kp_mask': obj_future_kp_mask,
             'center_gt_trajs': center_gt_trajs,
             'center_gt_trajs_mask': center_gt_trajs_mask,
             'center_gt_final_valid_idx': center_gt_final_valid_idx,
