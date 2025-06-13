@@ -145,8 +145,8 @@ class BaseDataset(Dataset):
                     output = self.postprocess(output)
 
                 except Exception as e:
-                    print('Warning: {} in {}'.format(e, mod_file_name))
-                    output = None
+                   print('Warning: {} in {}'.format(e, mod_file_name))
+                   output = None
 
                 if output is None: continue
 
@@ -192,6 +192,7 @@ class BaseDataset(Dataset):
         # Use sentinel total_steps for next to preserve logic
         raw_next = np.where(valid_kp_t, t, total_steps)
         next_idx = np.minimum.accumulate(raw_next[:, ::-1], axis=1)[:, ::-1]
+
         # Pad with dummy frame to avoid out-of-bounds indexing
         pad = np.zeros((kp_t.shape[0], 1, 3), dtype=kp_t.dtype)
         inter_kp_t = np.concatenate([kp_t, pad], axis=1)
@@ -224,15 +225,17 @@ class BaseDataset(Dataset):
             fill = np.broadcast_to(fill[..., None], x_lin.shape)
 
             # apply only to the first total_steps entries to match fill shape
-            tmp = inter_padded[qualify][:, :total_steps, :]
+            tmp = inter_padded[qualify, :total_steps, :].copy()
             tmp[fill] = x_lin[fill]
-            inter_padded[qualify][:, :total_steps, :] = tmp
+            inter_padded[qualify, :total_steps, :] = tmp
+
+            #print(f"Interpolating {counts.sum()}")
 
         inter_keypoints = inter_padded[:, :total_steps, :]
         inter_flat = inter_keypoints.transpose(1, 0, 2).reshape(total_steps, 17*3)
 
         out = all_state.copy()
-        out[:, 9:60] = inter_flat
+        out[:, 10:61] = inter_flat
         return out
 
     def preprocess(self, scenario):
@@ -422,6 +425,7 @@ class BaseDataset(Dataset):
             sample_list = list(ret['tracks_to_predict'].keys())  # + ret.get('objects_of_interest', [])
             sample_list = list(set(sample_list))
 
+            
             valid_ids = []
             all_candidates = list(zip(track_infos['object_id'], track_infos['object_type']))
                 
@@ -513,6 +517,7 @@ class BaseDataset(Dataset):
         else:
             map_polylines_data, map_polylines_mask, map_polylines_center = self.get_map_data(
                 center_objects=center_objects, map_infos=info['map_infos'], skip =True)
+        
         ret_dict['map_polylines'] = map_polylines_data
         ret_dict['map_polylines_mask'] = map_polylines_mask.astype(bool)
         ret_dict['map_polylines_center'] = map_polylines_center
