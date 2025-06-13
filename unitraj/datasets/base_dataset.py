@@ -725,9 +725,11 @@ class BaseDataset(Dataset):
         valid_past_mask = np.logical_not(obj_trajs_past[:, :, 9].sum(axis=-1) == 0) # -1 -> 9 (valid is in position 9)
 
         obj_trajs_mask = obj_trajs_mask[:, valid_past_mask]
+        obj_kp_mask = obj_kp_mask[:, valid_past_mask, :] # keypoints
         obj_trajs_data = obj_trajs_data[:, valid_past_mask]
         obj_trajs_future_state = obj_trajs_future_state[:, valid_past_mask]
         obj_trajs_future_mask = obj_trajs_future_mask[:, valid_past_mask]
+        obj_future_kp_mask = obj_future_kp_mask[:, valid_past_mask, :] # keypoints
 
         obj_trajs_pos = obj_trajs_data[:, :, :, 0:3]
         num_center_objects, num_objects, num_timestamps, _ = obj_trajs_pos.shape
@@ -752,14 +754,17 @@ class BaseDataset(Dataset):
 
         obj_trajs_data = np.take_along_axis(obj_trajs_data, topk_idxs, axis=1)
         obj_trajs_mask = np.take_along_axis(obj_trajs_mask, topk_idxs[..., 0], axis=1)
+        obj_kp_mask = np.take_along_axis(obj_kp_mask, topk_idxs[..., 0, None], axis=1) # keypoints
         obj_trajs_pos = np.take_along_axis(obj_trajs_pos, topk_idxs, axis=1)
         obj_trajs_last_pos = np.take_along_axis(obj_trajs_last_pos, topk_idxs[..., 0], axis=1)
         obj_trajs_future_state = np.take_along_axis(obj_trajs_future_state, topk_idxs, axis=1)
         obj_trajs_future_mask = np.take_along_axis(obj_trajs_future_mask, topk_idxs[..., 0], axis=1)
+        obj_future_kp_mask = np.take_along_axis(obj_future_kp_mask, topk_idxs[..., 0, None], axis=1)
         track_index_to_predict_new = np.zeros(len(track_index_to_predict), dtype=np.int64)
 
         obj_trajs_data = np.pad(obj_trajs_data, ((0, 0), (0, max_num_agents - obj_trajs_data.shape[1]), (0, 0), (0, 0)))
         obj_trajs_mask = np.pad(obj_trajs_mask, ((0, 0), (0, max_num_agents - obj_trajs_mask.shape[1]), (0, 0)))
+        obj_kp_mask = np.pad(obj_kp_mask, ((0, 0), (0, max_num_agents - obj_kp_mask.shape[1]), (0, 0), (0, 0))) # keypoints
         obj_trajs_pos = np.pad(obj_trajs_pos, ((0, 0), (0, max_num_agents - obj_trajs_pos.shape[1]), (0, 0), (0, 0)))
         obj_trajs_last_pos = np.pad(obj_trajs_last_pos,
                                     ((0, 0), (0, max_num_agents - obj_trajs_last_pos.shape[1]), (0, 0)))
@@ -767,6 +772,8 @@ class BaseDataset(Dataset):
                                         ((0, 0), (0, max_num_agents - obj_trajs_future_state.shape[1]), (0, 0), (0, 0)))
         obj_trajs_future_mask = np.pad(obj_trajs_future_mask,
                                        ((0, 0), (0, max_num_agents - obj_trajs_future_mask.shape[1]), (0, 0)))
+        
+        obj_future_kp_mask = np.pad(obj_future_kp_mask, ((0, 0), (0, max_num_agents - obj_kp_mask.shape[1]), (0, 0), (0, 0))) # keypoints
 
         return (obj_trajs_data, obj_trajs_mask.astype(bool), obj_trajs_pos, obj_trajs_last_pos,
                 obj_trajs_future_state, obj_trajs_future_mask, center_gt_trajs, center_gt_trajs_mask,
