@@ -167,73 +167,90 @@ class BaseDataset(Dataset):
 
         return file_list
     
-    def interpolate_keypoints(self, all_state, threshold = 30):
+    def interpolate_keypoints(self, all_state, type, temp_thresh = 30, mask_thresh = 0.05):
         # all_state [total_steps, 62]
 
         total_steps = all_state.shape[0]
-
-        center = np.expand_dims(all_state[:, 0:3], axis=-2) # [total_steps, 1, 3]
-        keypoints = all_state[:, 10:61].reshape(-1, 17, 3) # [total_steps, 17, 3]
-        valid = all_state[:, 9].astype(bool) # [total_steps]
         
-        matches = np.all(keypoints == center, axis=-1) # [total_steps, 17]
-        valid_kp = ~matches & np.expand_dims(valid, axis=-1) # [total_steps, 17]
-
-        # per-series processing
-        kp_t = keypoints.transpose(1,0,2)
-        valid_kp_t = valid_kp.T.astype(bool)
+        if type == "PEDESTRIAN" or type == "CYCLIST":
         
-        # prev and next logic
-        t = np.arange(total_steps)
+            center = np.expand_dims(all_state[:, 0:3], axis=-2) # [total_steps, 1, 3]
+            keypoints = all_state[:, 10:61].reshape(-1, 17, 3) # [total_steps, 17, 3]
+            valid = all_state[:, 9].astype(bool) # [total_steps]
+            valid_graph = all_state[:, -1].astype(bool) # [total_steps]
 
-        raw_prev = np.where(valid_kp_t, t, -1)
-        prev_idx = np.maximum.accumulate(raw_prev, axis=1)
+            combined_valid = np.logical_and(valid, valid_graph)
+            
+            distances = np.linalg.norm(keypoints - center, axis=-1)
+            kp_valid = np.logical_and(distances >= mask_thresh,
+                                np.expand_dims(combined_valid, axis=-1))
 
-        # Use sentinel total_steps for next to preserve logic
-        raw_next = np.where(valid_kp_t, t, total_steps)
-        next_idx = np.minimum.accumulate(raw_next[:, ::-1], axis=1)[:, ::-1]
-        # Pad with dummy frame to avoid out-of-bounds indexing
-        pad = np.zeros((kp_t.shape[0], 1, 3), dtype=kp_t.dtype)
-        inter_kp_t = np.concatenate([kp_t, pad], axis=1)
-        inter_padded = inter_kp_t.copy()
 
-        # Check if valid steps >= 2
-        counts = valid_kp_t.sum(axis=1) #[17]
-        qualify = (counts >= 2)
+            # per-series processing
+            kp_t = keypoints.transpose(1,0,2)
+            valid_kp_t = kp_valid.T.astype(bool)
+            
+            # prev and next logic
+            t = np.arange(total_steps)
 
-        if qualify.sum() > 0:
-            pi = prev_idx[qualify]
-            ni = next_idx[qualify]
+            raw_prev = np.where(valid_kp_t, t, -1)
+            prev_idx = np.maximum.accumulate(raw_prev, axis=1)
 
-            denom = (ni - pi).astype(float)
-            denom[denom == 0] = 1.0
+            # Use sentinel total_steps for next to preserve logic
+            raw_next = np.where(valid_kp_t, t, total_steps)
+            next_idx = np.minimum.accumulate(raw_next[:, ::-1], axis=1)[:, ::-1]
+            # Pad with dummy frame to avoid out-of-bounds indexing
+            pad = np.zeros((kp_t.shape[0], 1, 3), dtype=kp_t.dtype)
+            inter_kp_t = np.concatenate([kp_t, pad], axis=1)
+            inter_padded = inter_kp_t.copy()
 
-            t_mat = np.broadcast_to(t, (qualify.sum(), total_steps)).astype(float)
-            w = ((t_mat - pi) / denom)[..., None]
+            # Check if valid steps >= 2
+            counts = valid_kp_t.sum(axis=1) #[17]
+            qualify = (counts >= 2)
 
-            sel = inter_padded[qualify]
-            pi_exp = pi[..., None]
-            ni_exp = ni[..., None]
+            has_interp = np.zeros(total_steps).astype(bool)
 
-            x_p = np.take_along_axis(sel, pi_exp, axis=1)
-            x_n = np.take_along_axis(sel, ni_exp, axis=1)
+            if qualify.sum() > 0:
+                pi = prev_idx[qualify]
+                ni = next_idx[qualify]
 
-            x_lin = x_p * (1 - w) + x_n * w
+                denom = (ni - pi).astype(float)
+                denom[denom == 0] = 1.0
 
-            fill = (~valid_kp_t[qualify]) & (pi >= 0) & (ni < total_steps) & ((ni - pi) <= threshold)
-            fill = np.broadcast_to(fill[..., None], x_lin.shape)
+                t_mat = np.broadcast_to(t, (qualify.sum(), total_steps)).astype(float)
+                w = ((t_mat - pi) / denom)[..., None]
 
-            # apply only to the first total_steps entries to match fill shape
-            tmp = inter_padded[qualify, :total_steps, :].copy()
-            tmp[fill] = x_lin[fill]
-            inter_padded[qualify, :total_steps, :] = tmp
+                sel = inter_padded[qualify]
+                pi_exp = pi[..., None]
+                ni_exp = ni[..., None]
 
-        inter_keypoints = inter_padded[:, :total_steps, :]
-        inter_flat = inter_keypoints.transpose(1, 0, 2).reshape(total_steps, 17*3)
+                x_p = np.take_along_axis(sel, pi_exp, axis=1)
+                x_n = np.take_along_axis(sel, ni_exp, axis=1)
 
-        out = all_state.copy()
-        out[:, 10:61] = inter_flat
-        return out
+                x_lin = x_p * (1 - w) + x_n * w
+
+                fill = (~valid_kp_t[qualify]) & (pi >= 0) & (ni < total_steps) & ((ni - pi) <= temp_thresh)
+                fill = np.broadcast_to(fill[..., None], x_lin.shape)
+
+                # apply only to the first total_steps entries to match fill shape
+                tmp = inter_padded[qualify, :total_steps, :].copy()
+                tmp[fill] = x_lin[fill]
+                inter_padded[qualify, :total_steps, :] = tmp
+
+                has_interp = fill.any(axis=(0, 2))
+
+            inter_keypoints = inter_padded[:, :total_steps, :]
+            inter_flat = inter_keypoints.transpose(1, 0, 2).reshape(total_steps, 17*3)
+
+            out = all_state.copy()
+            out[:, 10:61] = inter_flat
+            
+            out[has_interp, -1] = 1
+            
+            return out
+        
+        else:
+            return all_state
 
     def preprocess(self, scenario):
 
@@ -273,7 +290,7 @@ class BaseDataset(Dataset):
             all_state = all_state[starting_fame:ending_fame]
 
             # Interpolate keypoints
-            all_state = self.interpolate_keypoints(all_state)
+            all_state = self.interpolate_keypoints(all_state, type = v['type'])
 
             assert all_state.shape[0] == total_steps, f'Error: {all_state.shape[0]} != {total_steps}'
 
@@ -622,19 +639,26 @@ class BaseDataset(Dataset):
         else:
             data_loaded = dict(data_list)
         return data_loaded
-    
-    def update_kp_mask(self, center_bbox, keypoints, valid_mask, kp_mask): 
+
+    def update_kp_mask(self,
+                       center_bbox,
+                       keypoints, 
+                       valid_mask,
+                       valid_graph, 
+                       thresh = 0.05):
         
-        keypoints = keypoints.reshape(*kp_mask.shape, 3)
+        combined_valid = np.logical_and(valid_mask, valid_graph)
+            
+        keypoints = keypoints.reshape(*keypoints.shape[:-1], 17, 3)
 
-        center_bbox = np.expand_dims(center_bbox, axis=-2)
+        center = np.expand_dims(center_bbox, axis=-2)
 
-        matches = np.all(keypoints == center_bbox, axis=-1)
-        matches = matches & np.expand_dims(valid_mask, axis=-1).astype(bool)
+        distances = np.linalg.norm(keypoints - center, axis=-1)
 
-        kp_mask[matches] = 1
+        kp_valid = np.logical_and(distances >= thresh,
+                                np.expand_dims(combined_valid, axis=-1))
 
-        return kp_mask
+        return kp_valid
 
     def get_agent_data(
             self, center_objects, obj_trajs_past, obj_trajs_future, track_index_to_predict, sdc_track_index, timestamps,
@@ -691,9 +715,8 @@ class BaseDataset(Dataset):
             center_bbox = obj_trajs[:, :, :, 0:3],
             keypoints = obj_trajs[:, :, :, 10:61],
             valid_mask = obj_trajs_mask,
-            kp_mask = obj_kp_mask
+            valid_graph = obj_trajs[:, :, :, -1]
         )
-
 
         obj_trajs_future = obj_trajs_future.astype(np.float32)
         obj_trajs_future = self.transform_trajs_to_center_coords(
@@ -713,7 +736,7 @@ class BaseDataset(Dataset):
             center_bbox = obj_trajs_future[:, :, :, 0:3],
             keypoints = obj_trajs_future[:, :, :, 10:61],
             valid_mask = obj_trajs_future_mask,
-            kp_mask = obj_future_kp_mask
+            valid_graph = obj_trajs_future[:, :, :, -1]
         )
 
         center_obj_idxs = np.arange(len(track_index_to_predict))
