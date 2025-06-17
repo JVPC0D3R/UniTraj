@@ -34,6 +34,9 @@ class BaseDataset(Dataset):
         self.config = config
         self.data_loaded_memory = []
         self.file_cache = {}
+        self.keep_global_coords = config['keep_global_coords']
+        self.use_ped_cyc_keypoints = config['use_ped_cyc_keypoints']
+        self.inter_keypoints = config['interpolate_keypoints']
         self.load_data()
 
     def load_data(self):
@@ -122,20 +125,24 @@ class BaseDataset(Dataset):
             data_chunk = pickle.load(f)
         file_list = {}
         data_path, mapping, data_list, dataset_name = data_chunk
-        mod_name = self.config['mod_name']
-        hdf5_path = os.path.join(self.cache_path, f'{worker_index}{mod_name}.h5')
+        if self.use_ped_cyc_keypoints:
+            mod_name = '_skeleton'
+            hdf5_path = os.path.join(self.cache_path, f'{worker_index}{mod_name}.h5')
+        else:
+            hdf5_path = os.path.join(self.cache_path, f'{worker_index}.h5')
 
         with h5py.File(hdf5_path, 'w') as f:
             for cnt, file_name in enumerate(data_list):
                 if worker_index == 0 and cnt % max(int(len(data_list) / 10), 1) == 0:
                     print(f'{cnt}/{len(data_list)} data processed', flush=True)
+                if self.use_ped_cyc_keypoints:
+                    base, ext = os.path.splitext(file_name)
+                    mod_file_name = f"{base}{mod_name}{ext}"
 
-                base, ext = os.path.splitext(file_name)
-                mod_file_name = f"{base}{mod_name}{ext}"
-
-                mod_mapping = self.modify_mapping(mapping, mod_name)
-
-                scenario = read_scenario(data_path, mod_mapping, mod_file_name)
+                    mod_mapping = self.modify_mapping(mapping, mod_name)
+                    scenario = read_scenario(data_path, mod_mapping, mod_file_name)
+                else:
+                    scenario = read_scenario(data_path, mapping, file_name)
 
                 try:
                     output = self.preprocess(scenario)
@@ -184,7 +191,6 @@ class BaseDataset(Dataset):
             distances = np.linalg.norm(keypoints - center, axis=-1)
             kp_valid = np.logical_and(distances >= mask_thresh,
                                 np.expand_dims(combined_valid, axis=-1))
-
 
             # per-series processing
             kp_t = keypoints.transpose(1,0,2)
@@ -279,18 +285,21 @@ class BaseDataset(Dataset):
                 if len(value.shape) == 1:
                     state[key] = np.expand_dims(value, axis=-1)
             all_state = [state['position'], state['length'], state['width'], state['height'], state['heading'],
-                         state['velocity'], state['valid'],
-                         state[self.config['attr_1']].reshape(state[self.config['attr_1']].shape[0], -1),
-                         state[self.config['attr_2']]]
-            # type, x,y,z,l,w,h,heading,vx,vy,valid + attr_1,attr_2 | (total_steps, 10) -> (total_steps, 62)
+                         state['velocity'], state['valid']]
+            if self.use_ped_cyc_keypoints:
+                         all_state.extend(
+                         [state['skeleton'].reshape(state['skeleton'].shape[0], -1),
+                         state['valid_sk']]
+                         )
+            # type, x,y,z,l,w,h,heading,vx,vy,valid + (skeleton,valid_sk) | (total_steps, 10) -> (total_steps, 62)
             all_state = np.concatenate(all_state, axis=-1)
             # all_state = all_state[::sample_inverval]
             if all_state.shape[0] < ending_fame:
                 all_state = np.pad(all_state, ((ending_fame - all_state.shape[0], 0), (0, 0)))
             all_state = all_state[starting_fame:ending_fame]
 
-            # Interpolate keypoints
-            all_state = self.interpolate_keypoints(all_state, type = v['type'])
+            if self.inter_keypoints:
+                all_state = self.interpolate_keypoints(all_state, type = v['type'])
 
             assert all_state.shape[0] == total_steps, f'Error: {all_state.shape[0]} != {total_steps}'
 
@@ -439,20 +448,28 @@ class BaseDataset(Dataset):
             sample_list = list(ret['tracks_to_predict'].keys())  # + ret.get('objects_of_interest', [])
             sample_list = list(set(sample_list))
 
-            valid_ids = []
-            all_candidates = list(zip(track_infos['object_id'], track_infos['object_type']))
-                
-            type_buckets = {1: [], 2: [], 3: []}
-            for idx, (oid, otype) in enumerate(all_candidates):
-                if len(valid_ids) < 8 and otype in type_buckets and track_infos['trajs'][idx, 10, 9]:
-                    if len(type_buckets[otype]) < 4:
-                        type_buckets[otype].append((oid, idx))
-                        valid_ids.append(oid)
+            if self.keep_global_coords:
+                valid_ids = []
+                all_candidates = list(zip(track_infos['object_id'], track_infos['object_type']))
+                    
+                type_buckets = {1: [], 2: [], 3: []}
+                for idx, (oid, otype) in enumerate(all_candidates):
+                    if len(valid_ids) < 8 and otype in type_buckets and track_infos['trajs'][idx, 10, 9]:
+                        if len(type_buckets[otype]) < 4:
+                            type_buckets[otype].append((oid, idx))
+                            valid_ids.append(oid)
             
-            tracks_to_predict = {
-                'track_index': [track_infos['object_id'].index(id) for id in valid_ids],
-                'object_type': [track_infos['object_type'][track_infos['object_id'].index(id)] for id in valid_ids],
-            }
+                tracks_to_predict = {
+                    'track_index': [track_infos['object_id'].index(id) for id in valid_ids],
+                    'object_type': [track_infos['object_type'][track_infos['object_id'].index(id)] for id in valid_ids],
+                }
+            else:
+                tracks_to_predict = {
+                    'track_index': [track_infos['object_id'].index(id) for id in sample_list if
+                                    id in track_infos['object_id']],
+                    'object_type': [track_infos['object_type'][track_infos['object_id'].index(id)] for id in sample_list if
+                                    id in track_infos['object_id']],
+                }
 
         ret['tracks_to_predict'] = tracks_to_predict
 
@@ -474,7 +491,7 @@ class BaseDataset(Dataset):
 
         track_index_to_predict = np.array(info['tracks_to_predict']['track_index'])
         obj_types = np.array(track_infos['object_type'])
-        obj_trajs_full = track_infos['trajs']  # (num_objects, num_timestamp, 10) -> (num_objects, num_timestamp, 62)
+        obj_trajs_full = track_infos['trajs']  # (num_objects, num_timestamp, 10) -> 62 if keypoints
         obj_trajs_past = obj_trajs_full[:, :current_time_index + 1]
         obj_trajs_future = obj_trajs_full[:, current_time_index + 1:]
 
@@ -529,7 +546,7 @@ class BaseDataset(Dataset):
                 center_objects=center_objects, map_infos=info['map_infos'])
         else:
             map_polylines_data, map_polylines_mask, map_polylines_center = self.get_map_data(
-                center_objects=center_objects, map_infos=info['map_infos'], skip =True)
+                center_objects=center_objects, map_infos=info['map_infos'])
         ret_dict['map_polylines'] = map_polylines_data
         ret_dict['map_polylines_mask'] = map_polylines_mask.astype(bool)
         ret_dict['map_polylines_center'] = map_polylines_center
@@ -671,8 +688,7 @@ class BaseDataset(Dataset):
             obj_trajs=obj_trajs_past,
             center_xyz=center_objects[:, 0:3],
             center_heading=center_objects[:, 6],
-            heading_index=6, rot_vel_index=[7, 8],
-            skip=True
+            heading_index=6, rot_vel_index=[7, 8]
         )
 
         object_onehot_mask = np.zeros((num_center_objects, num_objects, num_timestamps, 5))
@@ -697,47 +713,56 @@ class BaseDataset(Dataset):
         acce[:, :, 0, :] = acce[:, :, 1, :]
 
         obj_trajs_data = np.concatenate([
-            obj_trajs[:, :, :, 0:6],
-            object_onehot_mask,
-            object_time_embedding,
-            object_heading_embedding,
-            obj_trajs[:, :, :, 7:9],
-            acce,
-            obj_trajs[:, :, :, 10:] # keypoints + graph mask
-        ], axis=-1)
+                obj_trajs[:, :, :, 0:6],
+                object_onehot_mask,
+                object_time_embedding,
+                object_heading_embedding,
+                obj_trajs[:, :, :, 7:9],
+                acce,
+            ], axis=-1)
+
+        if self.use_ped_cyc_keypoints:
+            obj_trajs_data = np.concatenate([
+                obj_trajs_data,
+                obj_trajs[:, :, :, 10:] # skeleton + keypoint mask
+            ], axis=-1)
 
         obj_trajs_mask = obj_trajs[:, :, :, 9] # -1 -> 9 (valid is in position 9)
         obj_trajs_data[obj_trajs_mask == 0] = 0 # This also invalidate keypoints
 
         # Keypoint masking past
-        obj_kp_mask = np.zeros((*obj_trajs_mask.shape, 17), dtype=obj_trajs_mask.dtype)
-        obj_kp_mask = self.update_kp_mask(
-            center_bbox = obj_trajs[:, :, :, 0:3],
-            keypoints = obj_trajs[:, :, :, 10:61],
-            valid_mask = obj_trajs_mask,
-            valid_graph = obj_trajs[:, :, :, -1]
-        )
+        if self.use_ped_cyc_keypoints:
+            obj_kp_mask = np.zeros((*obj_trajs_mask.shape, 17), dtype=obj_trajs_mask.dtype)
+            obj_kp_mask = self.update_kp_mask(
+                center_bbox = obj_trajs[:, :, :, 0:3],
+                keypoints = obj_trajs[:, :, :, 10:61],
+                valid_mask = obj_trajs_mask,
+                valid_graph = obj_trajs[:, :, :, -1]
+            )
 
         obj_trajs_future = obj_trajs_future.astype(np.float32)
         obj_trajs_future = self.transform_trajs_to_center_coords(
             obj_trajs=obj_trajs_future,
             center_xyz=center_objects[:, 0:3],
             center_heading=center_objects[:, 6],
-            heading_index=6, rot_vel_index=[7, 8],
-            skip=True
+            heading_index=6, rot_vel_index=[7, 8]
         )
-        obj_trajs_future_state = obj_trajs_future[:, :, :, np.r_[0, 1, 7, 8, 10:61]]  # (x, y, vx, vy, keypoints)
+        if self.use_ped_cyc_keypoints:
+            obj_trajs_future_state = obj_trajs_future[:, :, :, np.r_[0, 1, 7, 8, 10:61]]  # (x, y, vx, vy, keypoints)
+        else:
+            obj_trajs_future_state = obj_trajs_future[:, :, :, [0, 1, 7, 8]]
         obj_trajs_future_mask = obj_trajs_future[:, :, :, 9] # -1 -> 9 (valid is in position 9)
         obj_trajs_future_state[obj_trajs_future_mask == 0] = 0
-        obj_trajs_future_graph_mask = obj_trajs_future[:, :, :, 61] # get graph mask
 
-        obj_future_kp_mask = np.zeros((*obj_trajs_future_mask.shape, 17), dtype=obj_trajs_future_mask.dtype)
-        obj_future_kp_mask = self.update_kp_mask(
-            center_bbox = obj_trajs_future[:, :, :, 0:3],
-            keypoints = obj_trajs_future[:, :, :, 10:61],
-            valid_mask = obj_trajs_future_mask,
-            valid_graph = obj_trajs_future[:, :, :, -1]
-        )
+        if self.use_ped_cyc_keypoints:
+            obj_trajs_future_graph_mask = obj_trajs_future[:, :, :, 61] # get graph mask
+            obj_future_kp_mask = np.zeros((*obj_trajs_future_mask.shape, 17), dtype=obj_trajs_future_mask.dtype)
+            obj_future_kp_mask = self.update_kp_mask(
+                center_bbox = obj_trajs_future[:, :, :, 0:3],
+                keypoints = obj_trajs_future[:, :, :, 10:61],
+                valid_mask = obj_trajs_future_mask,
+                valid_graph = obj_trajs_future[:, :, :, -1]
+            )
 
         center_obj_idxs = np.arange(len(track_index_to_predict))
         center_gt_trajs = obj_trajs_future_state[center_obj_idxs, track_index_to_predict]
@@ -748,11 +773,13 @@ class BaseDataset(Dataset):
         valid_past_mask = np.logical_not(obj_trajs_past[:, :, 9].sum(axis=-1) == 0) # -1 -> 9 (valid is in position 9)
 
         obj_trajs_mask = obj_trajs_mask[:, valid_past_mask]
-        obj_kp_mask = obj_kp_mask[:, valid_past_mask, :] # keypoints
+        if self.use_ped_cyc_keypoints:
+            obj_kp_mask = obj_kp_mask[:, valid_past_mask, :] # keypoints
         obj_trajs_data = obj_trajs_data[:, valid_past_mask]
         obj_trajs_future_state = obj_trajs_future_state[:, valid_past_mask]
         obj_trajs_future_mask = obj_trajs_future_mask[:, valid_past_mask]
-        obj_future_kp_mask = obj_future_kp_mask[:, valid_past_mask, :] # keypoints
+        if self.use_ped_cyc_keypoints:
+            obj_future_kp_mask = obj_future_kp_mask[:, valid_past_mask, :] # keypoints
 
         obj_trajs_pos = obj_trajs_data[:, :, :, 0:3]
         num_center_objects, num_objects, num_timestamps, _ = obj_trajs_pos.shape
@@ -777,17 +804,20 @@ class BaseDataset(Dataset):
 
         obj_trajs_data = np.take_along_axis(obj_trajs_data, topk_idxs, axis=1)
         obj_trajs_mask = np.take_along_axis(obj_trajs_mask, topk_idxs[..., 0], axis=1)
-        obj_kp_mask = np.take_along_axis(obj_kp_mask, topk_idxs[..., 0, None], axis=1) # keypoints
+        if self.use_ped_cyc_keypoints:
+            obj_kp_mask = np.take_along_axis(obj_kp_mask, topk_idxs[..., 0, None], axis=1) # keypoints
         obj_trajs_pos = np.take_along_axis(obj_trajs_pos, topk_idxs, axis=1)
         obj_trajs_last_pos = np.take_along_axis(obj_trajs_last_pos, topk_idxs[..., 0], axis=1)
         obj_trajs_future_state = np.take_along_axis(obj_trajs_future_state, topk_idxs, axis=1)
         obj_trajs_future_mask = np.take_along_axis(obj_trajs_future_mask, topk_idxs[..., 0], axis=1)
-        obj_future_kp_mask = np.take_along_axis(obj_future_kp_mask, topk_idxs[..., 0, None], axis=1)
+        if self.use_ped_cyc_keypoints:
+            obj_future_kp_mask = np.take_along_axis(obj_future_kp_mask, topk_idxs[..., 0, None], axis=1)
         track_index_to_predict_new = np.zeros(len(track_index_to_predict), dtype=np.int64)
 
         obj_trajs_data = np.pad(obj_trajs_data, ((0, 0), (0, max_num_agents - obj_trajs_data.shape[1]), (0, 0), (0, 0)))
         obj_trajs_mask = np.pad(obj_trajs_mask, ((0, 0), (0, max_num_agents - obj_trajs_mask.shape[1]), (0, 0)))
-        obj_kp_mask = np.pad(obj_kp_mask, ((0, 0), (0, max_num_agents - obj_kp_mask.shape[1]), (0, 0), (0, 0))) # keypoints
+        if self.use_ped_cyc_keypoints:
+            obj_kp_mask = np.pad(obj_kp_mask, ((0, 0), (0, max_num_agents - obj_kp_mask.shape[1]), (0, 0), (0, 0))) # keypoints
         obj_trajs_pos = np.pad(obj_trajs_pos, ((0, 0), (0, max_num_agents - obj_trajs_pos.shape[1]), (0, 0), (0, 0)))
         obj_trajs_last_pos = np.pad(obj_trajs_last_pos,
                                     ((0, 0), (0, max_num_agents - obj_trajs_last_pos.shape[1]), (0, 0)))
@@ -795,8 +825,11 @@ class BaseDataset(Dataset):
                                         ((0, 0), (0, max_num_agents - obj_trajs_future_state.shape[1]), (0, 0), (0, 0)))
         obj_trajs_future_mask = np.pad(obj_trajs_future_mask,
                                        ((0, 0), (0, max_num_agents - obj_trajs_future_mask.shape[1]), (0, 0)))
-        
-        obj_future_kp_mask = np.pad(obj_future_kp_mask, ((0, 0), (0, max_num_agents - obj_future_kp_mask.shape[1]), (0, 0), (0, 0))) # keypoints
+        if self.use_ped_cyc_keypoints:
+            obj_future_kp_mask = np.pad(obj_future_kp_mask, ((0, 0), (0, max_num_agents - obj_future_kp_mask.shape[1]), (0, 0), (0, 0))) # keypoints
+        else:
+            obj_kp_mask = None
+            obj_future_kp_mask = None
 
         return (obj_trajs_data, obj_trajs_mask.astype(bool), obj_trajs_pos, obj_trajs_last_pos,
                 obj_trajs_future_state, obj_trajs_future_mask, center_gt_trajs, center_gt_trajs_mask,
@@ -825,7 +858,7 @@ class BaseDataset(Dataset):
         return center_objects, track_index_to_predict
 
     def transform_trajs_to_center_coords(self, obj_trajs, center_xyz, center_heading, heading_index,
-                                         rot_vel_index=None, skip =False):
+                                         rot_vel_index=None):
         """
         Args:
             obj_trajs (num_objects, num_timestamps, num_attrs): 10 -> 62
@@ -841,7 +874,7 @@ class BaseDataset(Dataset):
 
         obj_trajs = np.tile(obj_trajs[None, :, :, :], (num_center_objects, 1, 1, 1))
 
-        if not skip:
+        if not self.keep_global_coords:
             obj_trajs[:, :, :, 0:center_xyz.shape[1]] -= center_xyz[:, None, None, :]
             obj_trajs[:, :, :, 0:2] = common_utils.rotate_points_along_z(
                 points=obj_trajs[:, :, :, 0:2].reshape(num_center_objects, -1, 2),
@@ -851,7 +884,7 @@ class BaseDataset(Dataset):
             obj_trajs[:, :, :, heading_index] -= center_heading[:, None, None]
 
         # rotate direction of velocity
-        if rot_vel_index is not None and not skip:
+        if rot_vel_index is not None and not self.keep_global_coords:
             assert len(rot_vel_index) == 2
             obj_trajs[:, :, :, rot_vel_index] = common_utils.rotate_points_along_z(
                 points=obj_trajs[:, :, :, rot_vel_index].reshape(num_center_objects, -1, 2),
@@ -861,7 +894,7 @@ class BaseDataset(Dataset):
         # kps stored between 10 and 51
         keypoints = []
 
-        if not skip:
+        if not self.keep_global_coords and self.use_ped_cyc_keypoints:
             kp_array = obj_trajs[:,:,:,10:61].reshape(num_center_objects,num_objects,num_timestamps,17,3)
 
             for kp in range(17):
@@ -877,7 +910,7 @@ class BaseDataset(Dataset):
 
         return obj_trajs
 
-    def get_map_data(self, center_objects, map_infos, skip = True):
+    def get_map_data(self, center_objects, map_infos):
 
         num_center_objects = center_objects.shape[0]
 
@@ -1013,7 +1046,7 @@ class BaseDataset(Dataset):
         map_polylines = np.concatenate((map_polylines, xy_pos_pre, map_types), axis=-1)
         map_polylines[map_polylines_mask == 0] = 0
 
-        if not skip:
+        if not self.keep_global_coords:
 
             return map_polylines, map_polylines_mask, map_polylines_center
 
